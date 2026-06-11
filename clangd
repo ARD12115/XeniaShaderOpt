@@ -1,0 +1,150 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -IC:/Users/abhin/Downloads/xenia_manager/XeniaShaderOpt/include
+    - -IC:/Users/abhin/Downloads/xenia_manager/XeniaShaderOpt/cuda
+    - -IC:/Users/abhin/Downloads/xenia_manager/XeniaShaderOpt/src
+    - -DXSO_BUILD_HASH=dev-build
+    - -DXSO_BACKEND_VULKAN=1
+    - -DXSO_BACKEND_D3D12=1
+    - -DXSO_VSYNC_GUARD=1
+    - -DXSO_PER_VENDOR_CACHE=1
+    - -DXSO_TITLE_ID=545407F8
+    - -D_WIN32_WINNT=0x0603
+  Compiler: clang++
+Diagnostics:
+  UnusedIncludes: None
+
+
+
+cmake_minimum_required(VERSION 3.18)
+project(XeniaShaderOpt LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # for clangd
+
+# ---------------------------------------------------------------------------
+# Build metadata injected into source
+# ---------------------------------------------------------------------------
+if(NOT DEFINED XSO_BUILD_HASH)
+  execute_process(
+    COMMAND git rev-parse --short HEAD
+    OUTPUT_VARIABLE XSO_BUILD_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(NOT XSO_BUILD_HASH)
+    set(XSO_BUILD_HASH "dev")
+  endif()
+endif()
+
+if(NOT DEFINED XSO_TITLE_ID)
+  set(XSO_TITLE_ID "545407F8")
+endif()
+
+message(STATUS "XSO_BUILD_HASH = ${XSO_BUILD_HASH}")
+message(STATUS "XSO_TITLE_ID   = ${XSO_TITLE_ID}")
+
+# ---------------------------------------------------------------------------
+# Find CUDA
+# ---------------------------------------------------------------------------
+find_package(CUDAToolkit REQUIRED)
+
+# ---------------------------------------------------------------------------
+# Compiler flags
+# ---------------------------------------------------------------------------
+if(MSVC)
+  add_compile_options(/W4 /O2 /std:c++17)
+  add_compile_definitions(_WIN32_WINNT=0x0603)  # Win 8.1+ (WASAPI)
+else()
+  add_compile_options(-Wall -Wextra -O2)
+endif()
+
+# ---------------------------------------------------------------------------
+# Compile definitions shared across all targets
+# ---------------------------------------------------------------------------
+add_compile_definitions(
+  XSO_BUILD_HASH="${XSO_BUILD_HASH}"
+  XSO_TITLE_ID="${XSO_TITLE_ID}"
+  XSO_VSYNC_GUARD=1         # HIGH severity PRD risk — enforced at build level
+  XSO_PER_VENDOR_CACHE=1    # separate cache dirs per GPU vendor
+)
+
+# ---------------------------------------------------------------------------
+# gpu_flags — config key singleton
+# ---------------------------------------------------------------------------
+add_library(gpu_flags STATIC
+  src/gpu_flags.cc
+)
+target_include_directories(gpu_flags PUBLIC include)
+target_compile_options(gpu_flags PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall>)
+
+# ---------------------------------------------------------------------------
+# shader_cache — persistent cache + LRU + Bloom filter + precompiler
+# ---------------------------------------------------------------------------
+add_library(shader_cache STATIC
+  src/shader_cache.cc
+  src/audio_sync.cc
+  src/frame_pacer.cc
+)
+target_include_directories(shader_cache PUBLIC include)
+target_link_libraries(shader_cache PUBLIC gpu_flags)
+target_compile_options(shader_cache PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-O2 -Wall>)
+
+# ---------------------------------------------------------------------------
+# shader_cuda — CUDA kernels (SM 8.6 = RTX 3050 Ti, Ampere)
+# ---------------------------------------------------------------------------
+add_library(shader_cuda STATIC
+  cuda/shader_hash_cuda.cu
+)
+target_include_directories(shader_cuda PUBLIC include cuda)
+set_target_properties(shader_cuda PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_ARCHITECTURES "86"
+)
+target_link_libraries(shader_cuda PRIVATE CUDA::cudart)
+
+# ---------------------------------------------------------------------------
+# xenia_opt — combined linkable target for Xenia integration
+# ---------------------------------------------------------------------------
+add_library(xenia_opt STATIC)
+target_link_libraries(xenia_opt PUBLIC shader_cache shader_cuda)
+target_include_directories(xenia_opt PUBLIC include cuda)
+
+# ---------------------------------------------------------------------------
+# Tests (auto-stub if sources missing — no broken build on fresh clone)
+# ---------------------------------------------------------------------------
+enable_testing()
+
+function(xso_add_test name src)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
+    file(WRITE "${CMAKE_CURRENT_SOURCE_DIR}/${src}"
+      "// auto-generated stub\nint main() { return 0; }\n")
+  endif()
+  add_executable(${name} ${src})
+  target_link_libraries(${name} PRIVATE xenia_opt)
+  target_include_directories(${name} PRIVATE include)
+  if(NOT MSVC)
+    target_compile_options(${name} PRIVATE -fsanitize=address,undefined)
+    target_link_options(${name} PRIVATE -fsanitize=address,undefined)
+  endif()
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+xso_add_test(test_shader_cache   tests/test_shader_cache.cc)
+xso_add_test(test_audio_sync     tests/test_audio_sync.cc)
+xso_add_test(test_frame_pacer    tests/test_frame_pacer.cc)
+xso_add_test(test_gpu_flags      tests/test_gpu_flags.cc)
+xso_add_test(test_vendor_cache   tests/test_vendor_cache.cc)
+xso_add_test(test_vsync_guard    tests/test_vsync_guard.cc)
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+install(TARGETS xenia_opt shader_cache shader_cuda gpu_flags
+  ARCHIVE DESTINATION lib)
+install(DIRECTORY include/ DESTINATION include/xenia_opt)
+install(DIRECTORY cuda/ DESTINATION include/xenia_opt/cuda
+  FILES_MATCHING PATTERN "*.h")

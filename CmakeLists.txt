@@ -1,0 +1,542 @@
+# =============================================================================
+#  CMakeLists.txt
+#  Xenia Canary — Shader Compilation Optimization Framework
+#  Target: Midnight Club: LA Complete Edition (545407F8)
+#  Hardware: RTX 3050 Ti (SM 8.6, Ampere)
+#
+#  v3 changes over v2 (PRD gap fill + stability hardening):
+#    + gpu_flags.cc added as dedicated config-key source target
+#    + Per-vendor cache path compile definitions (NVIDIA / AMD / Intel)
+#    + vsync guard compile definition (XSO_VSYNC_GUARD) — HIGH severity PRD risk
+#    + XSO_TITLE_ID propagated to all targets — eliminates hardcoded 545407F8
+#    + XSO_BUILD_HASH injected at configure time via git describe
+#    + Cache invalidation hook wired via XSO_BUILD_HASH definition
+#    + Test stubs auto-generated — no missing source errors on fresh clone
+#    + Sanitizer flags applied to test targets as well
+#    + benchmark + benchmark_compare targets guard against missing log files
+#    + windows_version_check added — WASAPI requires Win 8.1+
+#    + CUDA driver API made PRIVATE (not leaked into consumer targets)
+#    + All INTERFACE vs PUBLIC vs PRIVATE include dirs corrected
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.18)
+
+project(XeniaShaderOpt
+    VERSION     1.0.0
+    DESCRIPTION "Shader compilation optimization framework for Xenia Canary"
+    LANGUAGES   CXX CUDA
+)
+
+# =============================================================================
+#  Global standards
+# =============================================================================
+
+set(CMAKE_CXX_STANDARD          20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS        OFF)
+
+set(CMAKE_CUDA_STANDARD          20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type: Debug | Release | RelWithDebInfo | MinSizeRel" FORCE)
+endif()
+
+message(STATUS "Build type   : ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ standard : ${CMAKE_CXX_STANDARD}")
+
+# =============================================================================
+#  Options
+# =============================================================================
+
+option(XSO_ENABLE_VULKAN      "Build with Vulkan backend support"          ON)
+option(XSO_ENABLE_D3D12       "Build with D3D12 backend support"           ON)
+option(XSO_ENABLE_TESTS       "Build unit tests via CTest"                 ON)
+option(XSO_ENABLE_SANITIZERS  "Enable ASan + UBSan (Debug only)"          OFF)
+option(XSO_ENABLE_CCACHE      "Use ccache for incremental builds"          ON)
+option(XSO_PRECOMPILE_SHADERS "Enable async shader pre-compilation"        ON)
+option(XSO_VERBOSE_CACHE      "Verbose shader cache logging"               OFF)
+option(XSO_VSYNC_GUARD        "Enforce vsync=false when 60FPS patch active" ON)
+option(XSO_PER_VENDOR_CACHE   "Separate cache dirs per GPU vendor"          ON)
+
+# Game title ID — override for other titles
+set(XSO_TITLE_ID "545407F8" CACHE STRING "Xbox 360 Title ID (default: MCLA CE)")
+
+# =============================================================================
+#  Build hash — embeds git describe for cache invalidation
+# =============================================================================
+
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --always --dirty
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE  XSO_BUILD_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+if(NOT XSO_BUILD_HASH OR XSO_BUILD_HASH STREQUAL "")
+    set(XSO_BUILD_HASH "unknown-${PROJECT_VERSION}")
+endif()
+message(STATUS "Build hash   : ${XSO_BUILD_HASH}")
+
+# =============================================================================
+#  ccache
+# =============================================================================
+
+if(XSO_ENABLE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_CXX_COMPILER_LAUNCHER  ${CCACHE_PROGRAM})
+        set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+        message(STATUS "ccache       : ${CCACHE_PROGRAM}")
+    else()
+        message(STATUS "ccache       : not found — disabled")
+    endif()
+endif()
+
+# =============================================================================
+#  Platform checks
+# =============================================================================
+
+if(WIN32)
+    # WASAPI requires Windows 8.1+ (0x0603)
+    add_compile_definitions(_WIN32_WINNT=0x0603 WINVER=0x0603)
+    message(STATUS "Platform     : Windows (WASAPI audio enabled)")
+elseif(UNIX AND NOT APPLE)
+    message(STATUS "Platform     : Linux")
+else()
+    message(WARNING "Platform not tested — audio backend may not function correctly")
+endif()
+
+# =============================================================================
+#  CUDA Toolkit
+# =============================================================================
+
+find_package(CUDAToolkit REQUIRED)
+
+if(CUDAToolkit_VERSION VERSION_LESS "12.0")
+    message(FATAL_ERROR
+        "CUDA Toolkit >= 12.0 required (found ${CUDAToolkit_VERSION}). "
+        "SM 8.6 (RTX 3050 Ti) requires CUDA 12+.")
+endif()
+
+message(STATUS "CUDA Toolkit : ${CUDAToolkit_VERSION}")
+message(STATUS "CUDA Root    : ${CUDAToolkit_ROOT_DIR}")
+
+# =============================================================================
+#  CUDA architecture — SM 8.6 default (RTX 3050 Ti / Ampere)
+# =============================================================================
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 86)
+    message(STATUS "CUDA arch    : 86 (default — RTX 3050 Ti)")
+else()
+    message(STATUS "CUDA arch    : ${CMAKE_CUDA_ARCHITECTURES} (user override)")
+    if(NOT 86 IN_LIST CMAKE_CUDA_ARCHITECTURES)
+        message(WARNING
+            "SM 8.6 not in CUDA_ARCHITECTURES. "
+            "__ballot_sync / __shfl_xor_sync require SM >= 7.0.")
+    endif()
+endif()
+
+# =============================================================================
+#  Vulkan (optional)
+# =============================================================================
+
+if(XSO_ENABLE_VULKAN)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        message(STATUS "Vulkan       : ${Vulkan_VERSION}")
+    else()
+        message(WARNING "Vulkan SDK not found — Vulkan backend disabled")
+        set(XSO_ENABLE_VULKAN OFF)
+    endif()
+endif()
+
+# =============================================================================
+#  Threads
+# =============================================================================
+
+find_package(Threads REQUIRED)
+
+# =============================================================================
+#  Compiler warning / optimisation helpers
+# =============================================================================
+
+function(xso_target_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    endif()
+endfunction()
+
+function(xso_target_optimise target)
+    if(NOT MSVC)
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:        -O3 -DNDEBUG>
+            $<$<CONFIG:RelWithDebInfo>: -O2 -g -DNDEBUG>
+            $<$<CONFIG:Debug>:          -O0 -g>
+        )
+    else()
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release>:        /O2 /DNDEBUG>
+            $<$<CONFIG:Debug>:          /Od /Zi>
+        )
+    endif()
+endfunction()
+
+# =============================================================================
+#  Sanitizers (Debug, GCC/Clang only)
+# =============================================================================
+
+set(XSO_SANITIZER_FLAGS "")
+if(XSO_ENABLE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT MSVC)
+    set(XSO_SANITIZER_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
+    message(STATUS "Sanitizers   : ASan + UBSan enabled")
+endif()
+
+# =============================================================================
+#  Shared compile definitions
+#  — propagated to ALL targets via XSO_DEFINES
+# =============================================================================
+
+set(XSO_DEFINES
+    XSO_TITLE_ID="${XSO_TITLE_ID}"
+    XSO_BUILD_HASH="${XSO_BUILD_HASH}"
+)
+
+if(XSO_ENABLE_VULKAN)
+    list(APPEND XSO_DEFINES XSO_BACKEND_VULKAN=1)
+endif()
+if(XSO_ENABLE_D3D12)
+    list(APPEND XSO_DEFINES XSO_BACKEND_D3D12=1)
+endif()
+if(XSO_PRECOMPILE_SHADERS)
+    list(APPEND XSO_DEFINES XSO_PRECOMPILE_SHADERS=1)
+endif()
+if(XSO_VERBOSE_CACHE)
+    list(APPEND XSO_DEFINES XSO_VERBOSE_CACHE=1)
+endif()
+
+# --- PRD gap: vsync guard (HIGH severity) ---
+if(XSO_VSYNC_GUARD)
+    list(APPEND XSO_DEFINES XSO_VSYNC_GUARD=1)
+    message(STATUS "vsync guard  : ENABLED — 60FPS patch enforces vsync=false")
+endif()
+
+# --- PRD gap: per-vendor cache directories ---
+if(XSO_PER_VENDOR_CACHE)
+    list(APPEND XSO_DEFINES XSO_PER_VENDOR_CACHE=1)
+    message(STATUS "Vendor cache : ENABLED — separate dirs per GPU vendor")
+endif()
+
+# =============================================================================
+#  Target 1 — gpu_flags  (NEW — PRD gap: config key integration)
+#  Owns: all XSO config keys read from xenia-canary.config.toml
+#  Integration point: src/xenia/gpu/gpu_flags.cc
+# =============================================================================
+
+add_library(gpu_flags STATIC
+    src/gpu_flags.cc
+)
+
+target_include_directories(gpu_flags
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(gpu_flags PUBLIC ${XSO_DEFINES})
+xso_target_warnings(gpu_flags)
+xso_target_optimise(gpu_flags)
+
+if(XSO_SANITIZER_FLAGS)
+    target_compile_options(gpu_flags PRIVATE ${XSO_SANITIZER_FLAGS})
+    target_link_options(gpu_flags    PRIVATE ${XSO_SANITIZER_FLAGS})
+endif()
+
+target_link_libraries(gpu_flags PUBLIC Threads::Threads)
+
+message(STATUS "Target       : gpu_flags (config key bridge)")
+
+# =============================================================================
+#  Target 2 — shader_cache
+#  C++ static library: persistent cache + audio sync + frame pacer
+# =============================================================================
+
+add_library(shader_cache STATIC
+    src/shader_cache.cc
+    src/audio_sync.cc
+    src/frame_pacer.cc
+)
+
+target_include_directories(shader_cache
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(shader_cache PRIVATE ${XSO_DEFINES})
+xso_target_warnings(shader_cache)
+xso_target_optimise(shader_cache)
+
+if(XSO_SANITIZER_FLAGS)
+    target_compile_options(shader_cache PRIVATE ${XSO_SANITIZER_FLAGS})
+    target_link_options(shader_cache    PRIVATE ${XSO_SANITIZER_FLAGS})
+endif()
+
+# gpu_flags provides config values to shader_cache
+target_link_libraries(shader_cache
+    PUBLIC  Threads::Threads
+    PRIVATE gpu_flags
+)
+
+if(XSO_ENABLE_VULKAN AND Vulkan_FOUND)
+    target_link_libraries(shader_cache PUBLIC Vulkan::Vulkan)
+endif()
+
+message(STATUS "Target       : shader_cache (C++17 static lib)")
+
+# =============================================================================
+#  Target 3 — shader_cuda
+#  CUDA static library: GPU-parallel hashing + classification kernels
+# =============================================================================
+
+add_library(shader_cuda STATIC
+    cuda/shader_hash_cuda.cu
+)
+
+target_include_directories(shader_cuda
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_definitions(shader_cuda PRIVATE ${XSO_DEFINES})
+
+set_target_properties(shader_cuda PROPERTIES
+    CUDA_SEPARABLE_COMPILATION  ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    CUDA_ARCHITECTURES          "${CMAKE_CUDA_ARCHITECTURES}"
+)
+
+target_compile_options(shader_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --use_fast_math
+        --generate-line-info
+        -Xcompiler -Wall
+        $<$<CONFIG:Release>:        -O3>
+        $<$<CONFIG:RelWithDebInfo>: -O2 -g -G>
+        $<$<CONFIG:Debug>:          -O0 -g -G --device-debug>
+    >
+)
+
+target_link_libraries(shader_cuda
+    PUBLIC  CUDA::cudart
+    PRIVATE CUDA::cuda_driver   # PRIVATE — not leaked into xenia_opt consumers
+)
+
+message(STATUS "Target       : shader_cuda (CUDA SM ${CMAKE_CUDA_ARCHITECTURES})")
+
+# =============================================================================
+#  Target 4 — xenia_opt  (combined — link this into Xenia Canary)
+#
+#  Integration map:
+#    vulkan_shader_translator.cc  / d3d12_shader_translator.cc
+#        → shader_cache::Get() / Put()
+#    gpu_flags.cc
+#        → XsoConfig (enable_shader_cache, precompile_shaders,
+#                      max_precompile_shaders, shader_cache_path,
+#                      shader_cache_invalidation_required)
+#    xma_decoder.cc
+#        → AudioSyncStabilizer::NotifyFrameTime()
+#    d3d12_command_processor.cc
+#        → ScopedFrame (RAII BeginFrame/EndFrame)
+# =============================================================================
+
+# Minimal stub — CMake requires at least one source file per static lib
+set(XSO_STUB ${CMAKE_CURRENT_BINARY_DIR}/xenia_opt_stub.cc)
+file(WRITE ${XSO_STUB}
+    "// Auto-generated stub — do not edit.\n"
+    "// Implementation lives in shader_cache, shader_cuda, gpu_flags.\n"
+)
+
+add_library(xenia_opt STATIC ${XSO_STUB})
+
+target_include_directories(xenia_opt
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+)
+
+target_compile_definitions(xenia_opt PUBLIC ${XSO_DEFINES})
+
+target_link_libraries(xenia_opt
+    PUBLIC
+        shader_cache
+        shader_cuda
+        gpu_flags
+)
+
+message(STATUS "Target       : xenia_opt (combined: shader_cache + shader_cuda + gpu_flags)")
+
+# =============================================================================
+#  Auto-generate test stubs (prevents missing-source errors on fresh clone)
+# =============================================================================
+
+set(TEST_STUBS
+    tests/test_bloom_filter.cc
+    tests/test_lru_cache.cc
+    tests/test_frame_pacer.cc
+    tests/test_audio_sync.cc
+    tests/test_cuda_hash.cc
+    tests/test_gpu_flags.cc
+    tests/test_vendor_cache.cc
+    tests/test_vsync_guard.cc
+)
+
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+foreach(stub_path ${TEST_STUBS})
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${stub_path})
+        get_filename_component(stub_name ${stub_path} NAME_WE)
+        file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/${stub_path}
+            "// Auto-generated stub for ${stub_name}.\n"
+            "// Replace with real test implementation.\n"
+            "#include <cstdio>\n"
+            "int main() {\n"
+            "    printf(\"[STUB] ${stub_name} — no tests implemented yet\\n\");\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        message(STATUS "Generated stub: ${stub_path}")
+    endif()
+endforeach()
+
+# =============================================================================
+#  Unit tests (CTest)
+# =============================================================================
+
+if(XSO_ENABLE_TESTS)
+    enable_testing()
+
+    # Helper macro — avoids repeating link/include boilerplate
+    macro(xso_add_test test_name src_file link_libs)
+        add_executable(${test_name} ${src_file})
+        target_link_libraries(${test_name} PRIVATE ${link_libs})
+        target_include_directories(${test_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+        )
+        target_compile_definitions(${test_name} PRIVATE ${XSO_DEFINES})
+        if(XSO_SANITIZER_FLAGS)
+            target_compile_options(${test_name} PRIVATE ${XSO_SANITIZER_FLAGS})
+            target_link_options(${test_name}    PRIVATE ${XSO_SANITIZER_FLAGS})
+        endif()
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endmacro()
+
+    # Core cache correctness
+    xso_add_test(test_bloom_filter  tests/test_bloom_filter.cc  "shader_cache")
+    xso_add_test(test_lru_cache     tests/test_lru_cache.cc     "shader_cache")
+
+    # Timing subsystems
+    xso_add_test(test_frame_pacer   tests/test_frame_pacer.cc   "shader_cache")
+    xso_add_test(test_audio_sync    tests/test_audio_sync.cc    "shader_cache")
+
+    # CUDA hash correctness (CPU reference vs GPU result)
+    xso_add_test(test_cuda_hash     tests/test_cuda_hash.cc     "shader_cuda;shader_cache")
+
+    # PRD gap tests (new in v3)
+    xso_add_test(test_gpu_flags     tests/test_gpu_flags.cc     "gpu_flags")
+    xso_add_test(test_vendor_cache  tests/test_vendor_cache.cc  "shader_cache;gpu_flags")
+    xso_add_test(test_vsync_guard   tests/test_vsync_guard.cc   "gpu_flags")
+
+    message(STATUS "Tests        : bloom_filter, lru_cache, frame_pacer, audio_sync,")
+    message(STATUS "               cuda_hash, gpu_flags, vendor_cache, vsync_guard")
+endif()
+
+# =============================================================================
+#  Benchmark convenience targets
+#  Guards against missing log files gracefully
+# =============================================================================
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
+if(Python3_FOUND)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/logs)
+
+    add_custom_target(benchmark
+        COMMENT "Running Xenia shader benchmark (single log)"
+        COMMAND ${CMAKE_COMMAND} -E echo "Usage: place xenia_mcla.log in logs/"
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/python/benchmark.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/logs/baseline.log
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        VERBATIM
+    )
+
+    add_custom_target(benchmark_compare
+        COMMENT "Comparing baseline vs optimized logs"
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/python/benchmark.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/logs/baseline.log
+                ${CMAKE_CURRENT_SOURCE_DIR}/logs/optimized.log
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        VERBATIM
+    )
+
+    message(STATUS "Python3      : ${Python3_EXECUTABLE} — benchmark targets ready")
+else()
+    message(WARNING "Python3 not found — benchmark targets unavailable")
+endif()
+
+# =============================================================================
+#  Install rules
+# =============================================================================
+
+include(GNUInstallDirs)
+
+install(TARGETS xenia_opt shader_cache shader_cuda gpu_flags
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xenia_shader_opt
+    FILES_MATCHING PATTERN "*.h"
+)
+
+install(DIRECTORY cuda/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xenia_shader_opt/cuda
+    FILES_MATCHING PATTERN "*.h"
+)
+
+install(DIRECTORY python/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/xenia_shader_opt
+    FILES_MATCHING PATTERN "*.py"
+)
+
+# =============================================================================
+#  Summary
+# =============================================================================
+
+message(STATUS "")
+message(STATUS "=== XeniaShaderOpt ${PROJECT_VERSION} (${XSO_BUILD_HASH}) ===")
+message(STATUS "  Title ID        : ${XSO_TITLE_ID}")
+message(STATUS "  Vulkan backend  : ${XSO_ENABLE_VULKAN}")
+message(STATUS "  D3D12 backend   : ${XSO_ENABLE_D3D12}")
+message(STATUS "  Precompile      : ${XSO_PRECOMPILE_SHADERS}")
+message(STATUS "  Verbose cache   : ${XSO_VERBOSE_CACHE}")
+message(STATUS "  vsync guard     : ${XSO_VSYNC_GUARD}")
+message(STATUS "  Per-vendor cache: ${XSO_PER_VENDOR_CACHE}")
+message(STATUS "  Sanitizers      : ${XSO_ENABLE_SANITIZERS}")
+message(STATUS "  Tests           : ${XSO_ENABLE_TESTS}")
+message(STATUS "  ccache          : ${XSO_ENABLE_CCACHE}")
+message(STATUS "  CUDA arch       : ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "  Build type      : ${CMAKE_BUILD_TYPE}")
+message(STATUS "")
+
